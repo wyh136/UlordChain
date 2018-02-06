@@ -308,7 +308,6 @@ extern void CreateClaim(CScript& claimScript, CAmount nAmount, CWalletTx& wtxNew
 extern UniValue abandonclaim(const UniValue&params, bool fHelp);
 extern void ListNameClaims(const CWalletTx& wtx, const std::string &strAccount, int nMinDepth, UniValue &ret, const isminefilter &filter, bool list_spent);
 extern UniValue listnameclaims(const UniValue &params, bool fHelp);
-extern UniValue abandonsupport(const UniValue &params, bool fHelp);
 extern UniValue supportclaim(const UniValue&params, bool fHelp);
 extern UniValue abandonsupport(const UniValue &params, bool fHelp);
 
