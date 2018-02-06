@@ -3233,6 +3233,375 @@ bool CWallet::CreateTransaction(const vector<CRecipient>& vecSend, CWalletTx& wt
 
     return true;
 }
+bool CWallet::AbandonCash(const vector<CRecipient>& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, CAmount& nFeeRet,\
+                                int& nChangePosRet, std::string& strFailReason, const CCoinControl* coinControl, bool sign, const CWalletTx* pwtxIn, unsigned int nTxOut)
+{
+    AvailableCoinsType nCoinType = ALL_COINS;
+    bool fUseInstantSend = false;
+    CAmount nValue = 0;
+    int nChangePosRequest = nChangePosRet;
+    unsigned int nSubtractFeeFromAmount = 0;
+
+    BOOST_FOREACH (const CRecipient& recipient, vecSend)
+    {
+        if (nValue < 0 || recipient.nAmount < 0)
+        {
+            strFailReason = _("Transaction amounts must be positive");
+            return false;
+        }
+        
+        // 发送给接收方的钱数进行累加
+        nValue += recipient.nAmount;
+
+        // 如果接收方的fSubtractFeeFromAmount 
+        if (recipient.fSubtractFeeFromAmount)
+            nSubtractFeeFromAmount++;
+    }
+
+    // 如果接受的对象不存在，这个交易就未被激活
+    if (vecSend.empty() || nValue < 0)
+    {
+        strFailReason = _("Transaction amounts must be positive");
+        return false;
+    }
+
+    // 接收到达的时间
+    wtxNew.fTimeReceivedIsTxTime = true;
+
+    // 交易和钱包进行绑定
+    wtxNew.BindWallet(this);
+
+    // 构造一个在在缓冲中的交易对象
+    CMutableTransaction txNew;
+    bool fUsingWtxIn = (pwtxIn != NULL);
+
+    // 交易时间和区块的高度进行关联
+    txNew.nLockTime = chainActive.Height();
+
+    if (GetRandInt(10) == 0)
+        txNew.nLockTime = std::max(0, (int)txNew.nLockTime - GetRandInt(100));
+
+    // 断言 交易的时间要小于等于当前的高度才是有效     
+    assert(txNew.nLockTime <= (unsigned int)chainActive.Height());
+
+    // nLockTime的阈值:在这个值之下，它被解释为块号，否则是UNIX时间戳。
+    assert(txNew.nLockTime < LOCKTIME_THRESHOLD);
+    {
+        // 进程锁定，只能有一个进程访问钱包文件
+        LOCK2(cs_main, cs_wallet);
+        {
+            nFeeRet = 0;
+            while (true)
+            {
+                nChangePosRet = nChangePosRequest;
+                // 输入输出的数组进行清空
+                txNew.vin.clear();
+                txNew.vout.clear();
+                wtxNew.fFromMe = true;
+                bool fFirst = true;
+
+                // 对金额进行发送的金额进行设置
+                CAmount nValueToSelect = nValue;
+
+                // 如果减少费用设置为0 就把交易费加到发送的金额里面 证明只有一个接收方，就不用均摊交易费
+                if (nSubtractFeeFromAmount == 0)
+                    nValueToSelect += nFeeRet;
+
+                // 将优先级置为0
+                double dPriority = 0;
+                
+                // vouts to the payees 构造一个给接收方的交易输出，如果存在多个话，就构造多个交易输出
+                BOOST_FOREACH (const CRecipient& recipient, vecSend)
+                {
+                    // 构造一个ctxout对象存储着输出金额 和锁定脚本 构建一个输出对象
+                    CTxOut txout(recipient.nAmount, recipient.scriptPubKey);
+
+                    // 如果不允许缩减交易金额 fSubtractFeeFromAmount字段为真，接收方多个，交易费均摊
+                    if (recipient.fSubtractFeeFromAmount)
+                    {
+                        txout.nValue -= nFeeRet / nSubtractFeeFromAmount; // Subtract fee equally from each selected recipient 从每个选定的接受者减去平均的费用
+
+                        if (fFirst) // first receiver pays the remainder not divisible by output count 第一接收方支付其余未被输出数整除的费用 存在多少收款人
+                        {
+                            fFirst = false;
+                            txout.nValue -= nFeeRet % nSubtractFeeFromAmount;
+                        }
+                    }
+                    // 判断是否是灰尘交易费 就是交易费不足，不能创建交易
+                    if (txout.IsDust(::minRelayTxFee))
+                    {
+                        // 可判定交易费不足
+                        if (recipient.fSubtractFeeFromAmount && nFeeRet > 0)
+                        {
+                            if (txout.nValue < 0)
+                                strFailReason = _("The transaction amount is too small to pay the fee");
+                            else
+                                strFailReason = _("The transaction amount is too small to send after the fee has been deducted");
+                        }
+                        else
+                            strFailReason = _("Transaction amount too small");
+                        return false;
+                    }
+                    // 推入事务的储存交易输出的向量中 
+                    txNew.vout.push_back(txout);
+                }
+                // Choose coins to use 选择可用的硬币 CWalletTx中存储所有的可用的来源交易(就是可用的交易输出)
+                CAmount nValueNeeded = nValueToSelect;
+                if (fUsingWtxIn)
+                {
+                    nValueNeeded = nValueNeeded - pwtxIn->vout[nTxOut].nValue;
+                }
+
+                set<pair<const CWalletTx*,unsigned int> > setCoins;
+                CAmount nValueIn = 0;
+
+                if (!fUsingWtxIn || nValueNeeded > 0)
+                {
+                    if (!SelectCoins(nValueToSelect, setCoins, nValueIn, coinControl, nCoinType, fUseInstantSend))
+                    {
+                        if (nCoinType == ONLY_NOT1000IFMN) {
+                            strFailReason = _("Unable to locate enough funds for this transaction that are not equal 1000 DASH.");
+                        } else if (nCoinType == ONLY_NONDENOMINATED_NOT1000IFMN) {
+                            strFailReason = _("Unable to locate enough PrivateSend non-denominated funds for this transaction that are not equal 1000 DASH.");
+                        } else if (nCoinType == ONLY_DENOMINATED) {
+                            strFailReason = _("Unable to locate enough PrivateSend denominated funds for this transaction.");
+                            strFailReason += " " + _("PrivateSend uses exact denominated amounts to send funds, you might simply need to anonymize some more coins.");
+                        } else if (nValueIn < nValueToSelect) {
+                            strFailReason = _("Insufficient funds.");
+                        }
+                        if (fUseInstantSend) {
+                            if (nValueIn > sporkManager.GetSporkValue(SPORK_5_INSTANTSEND_MAX_VALUE)*COIN) {
+                                strFailReason += " " + strprintf(_("InstantSend doesn't support sending values that high yet. Transactions are currently limited to %1 DASH."), sporkManager.GetSporkValue(SPORK_5_INSTANTSEND_MAX_VALUE));
+                            } else {
+                                // could be not true but most likely that's the reason
+                                strFailReason += " " + strprintf(_("InstantSend requires inputs with at least %d confirmations, you might need to wait a few minutes and try again."), INSTANTSEND_CONFIRMATIONS_REQUIRED);
+                            }
+                        }
+                        return false;
+                    }
+                }
+
+                // 交易优先级的设置
+                BOOST_FOREACH(PAIRTYPE(const CWalletTx*, unsigned int) pcoin, setCoins)
+                {
+                    CAmount nCredit = pcoin.first->vout[pcoin.second].nValue;
+                    //The coin age after the next block (depth+1) is used instead of the current,
+                    //reflecting an assumption the user would accept a bit more delay for
+                    //a chance at a free transaction.
+                    //But mempool inputs might still be in the mempool, so their age stays 0
+                    int age = pcoin.first->GetDepthInMainChain();
+                    assert(age >= 0);
+                    if (age != 0)
+                        age += 1;
+                    dPriority += (double)nCredit * age;
+                }
+
+                if (fUsingWtxIn)
+                {
+                    nValueIn += pwtxIn->vout[nTxOut].nValue;
+                    setCoins.insert(make_pair(pwtxIn, nTxOut));
+
+                }
+                // 如果 nChange > 0 证明需要找零给自己
+                const CAmount nChange = nValueIn - nValueToSelect;
+                CTxOut newTxOut;
+                if (nChange > 0)
+                {
+                    //over pay for denominated transactions
+                    if (nCoinType == ONLY_DENOMINATED) 
+                    {
+                        nFeeRet += nChange;
+                        wtxNew.mapValue["DS"] = "1";
+                        // recheck skipped denominations during next mixing
+                        darkSendPool.ClearSkippedDenominations();
+                    } 
+                    else 
+                    {
+                        // 对于找零的金额 给自己创建一个vout对象
+                        CScript scriptChange;
+
+                        // coin control: send change to custom address 固定地址
+                        if (coinControl && !boost::get<CNoDestination>(&coinControl->destChange))
+                            scriptChange = GetScriptForDestination(coinControl->destChange);
+
+                        // no coin control: send change to newly generated address
+                        else
+                        {
+                            CPubKey vchPubKey;
+                            bool ret;
+                            ret = reservekey.GetReservedKey(vchPubKey);
+                            assert(ret); // should never fail, as we just unlocked
+
+                            scriptChange = GetScriptForDestination(vchPubKey.GetID());
+                        }
+
+                        newTxOut = CTxOut(nChange, scriptChange);
+
+                        // We do not move dust-change to fees, because the sender would end up paying more than requested.
+                        // This would be against the purpose of the all-inclusive feature.
+                        // So instead we raise the change and deduct from the recipient.
+                        // 在这里对自己的找零的金额进行修改，扣除掉交易费
+                        if (nSubtractFeeFromAmount > 0 && newTxOut.IsDust(::minRelayTxFee))
+                        {
+                            CAmount nDust = newTxOut.GetDustThreshold(::minRelayTxFee) - newTxOut.nValue;
+                            newTxOut.nValue += nDust; // raise change until no more dust
+                            for (unsigned int i = 0; i < vecSend.size(); i++) // subtract from first recipient
+                            {
+                                if (vecSend[i].fSubtractFeeFromAmount)
+                                {
+                                    txNew.vout[i].nValue -= nDust;
+                                    if (txNew.vout[i].IsDust(::minRelayTxFee))
+                                    {
+                                        strFailReason = _("The transaction amount is too small to send after the fee has been deducted");
+                                        return false;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (newTxOut.IsDust(::minRelayTxFee))
+                        {
+                            nChangePosRet = -1;
+                            nFeeRet += nChange;
+                            reservekey.ReturnKey();
+                        }
+                        else
+                        {
+                            if (nChangePosRet == -1)
+                            {
+                                // Insert change txn at random position:
+                                nChangePosRet = GetRandInt(txNew.vout.size()+1);
+                            }
+                            else if (nChangePosRet > txNew.vout.size())
+                            {
+                                strFailReason = _("Change index out of range");
+                                return false;
+                            }
+                        
+                            vector<CTxOut>::iterator position = txNew.vout.begin()+nChangePosRet;
+                            txNew.vout.insert(position, newTxOut);
+                        }
+                    }
+                }
+                else
+                    reservekey.ReturnKey();
+
+                BOOST_FOREACH(const PAIRTYPE(const CWalletTx*,unsigned int)& coin, setCoins){
+                    CTxIn txin = CTxIn(coin.first->GetHash(),coin.second,CScript(),
+                                              std::numeric_limits<unsigned int>::max()-1);
+                    txin.prevPubKey = coin.first->vout[coin.second].scriptPubKey;
+                    // 把构造好的交易输入放入内存事务中
+                    txNew.vin.push_back(txin);
+                }
+
+                // BIP69 https://github.com/kristovatlas/bips/blob/master/bip-0069.mediawiki 为了安全进行排序
+                sort(txNew.vin.begin(), txNew.vin.end());
+                sort(txNew.vout.begin(), txNew.vout.end());
+
+                // If there was change output added before, we must update its position now
+                if (nChangePosRet != -1) {
+                    int i = 0;
+                    BOOST_FOREACH(const CTxOut& txOut, txNew.vout)
+                    {
+                        if (txOut == newTxOut)
+                        {
+                            nChangePosRet = i;
+                            break;
+                        }
+                        i++;
+                    }
+                }
+
+                int nIn = 0;
+
+                // 拷贝构造事务
+                CTransaction txNewConst(txNew);
+                BOOST_FOREACH(const CTxIn& txin, txNew.vin)
+                {
+                    bool signSuccess;                   //成功签名的标记
+                    const CScript& scriptPubKey = txin.prevPubKey;
+                    CScript& scriptSigRes = txNew.vin[nIn].scriptSig;
+
+                    // 进行签名
+                    if (sign)
+                        signSuccess = ProduceSignature(TransactionSignatureCreator(this, &txNewConst, nIn, SIGHASH_ALL), scriptPubKey, scriptSigRes);
+                    else
+                        signSuccess = ProduceSignature(DummySignatureCreator(this), scriptPubKey, scriptSigRes);
+
+                    // 为假 签名失败
+                    if (!signSuccess)
+                    {
+                        strFailReason = _("Signing transaction failed");
+                        return false;
+                    }
+                    // 输入交易的位置
+                    nIn++;
+                }
+
+                unsigned int nBytes = ::GetSerializeSize(txNew, SER_NETWORK, PROTOCOL_VERSION);
+
+                // Remove scriptSigs if we used dummy signatures for fee calculation
+                if (!sign) {
+                    BOOST_FOREACH (CTxIn& txin, txNew.vin)
+                        txin.scriptSig = CScript();
+                }
+
+                *static_cast<CTransaction*>(&wtxNew) = CTransaction(txNew);
+    
+                // Limit size 交易字节不能超多最大值
+                if (nBytes >= MAX_STANDARD_TX_SIZE)
+                {
+                    strFailReason = _("Transaction too large");
+                    return false;
+                }
+    
+                // 交易的优先级计算
+                dPriority = wtxNew.ComputePriority(dPriority, nBytes);
+    
+                // Can we complete this as a free transaction? fSendFreeTransactions=false
+                if (fSendFreeTransactions && nBytes <= MAX_FREE_TRANSACTION_CREATE_SIZE)
+                {
+                    // Not enough fee: enough priority? 没有足够的费用
+                    double dPriorityNeeded = mempool.estimateSmartPriority(nTxConfirmTarget);
+                    
+                    // Require at least hard-coded AllowFree.
+                    if (dPriority >= dPriorityNeeded && AllowFree(dPriority))
+                        break;
+    
+                    // Small enough, and priority high enough, to send for free
+                    // if (dPriorityNeeded > 0 && dPriority >= dPriorityNeeded)
+                    //     break;
+                }
+                //需要的交易费
+                CAmount nFeeNeeded = GetMinimumFee(nBytes, nTxConfirmTarget, mempool);
+                if (coinControl && nFeeNeeded > 0 && coinControl->nMinimumTotalFee > nFeeNeeded) {
+                    nFeeNeeded = coinControl->nMinimumTotalFee;
+                }
+                if(fUseInstantSend) {
+                    nFeeNeeded = std::max(nFeeNeeded, CTxLockRequest(txNew).GetMinFee());
+                }
+    
+                // If we made it here and we aren't even able to meet the relay fee on the next pass, give up
+                // because we must be at the maximum allowed fee.
+                // 交易费太大
+                if (nFeeNeeded < ::minRelayTxFee.GetFee(nBytes))
+                {
+                    strFailReason = _("Transaction too large for fee policy");
+                    return false;
+                }
+    
+                if (nFeeRet >= nFeeNeeded)
+                    break; // Done, enough fee included. 在这里交易费充足可以进行交易
+    
+                // Include more fee and try again. 在这里进行重构交易，交易才能足够。
+                nFeeRet = nFeeNeeded;
+                continue;
+            }
+        }
+    }
+    return true;
+}
 
 /**
  * Call after CreateTransaction unless you want to abort
